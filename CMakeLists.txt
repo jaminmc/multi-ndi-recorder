@@ -24,6 +24,12 @@ elseif (APPLE)
     set(NDI_SDK_LIB "/Library/NDI SDK for Apple/lib/macOS" CACHE PATH "Path to NDI SDK lib")
     set(FFMPEG_INCLUDE "/usr/local/include" CACHE PATH "Path to FFmpeg includes")
     set(FFMPEG_LIB_ROOT "/usr/local" CACHE PATH "Path to FFmpeg root (containing lib)")
+elseif (UNIX AND NOT APPLE)
+    # Linux
+    set(NDI_SDK_INCLUDE "$ENV{HOME}/src/NDI SDK for Linux/include" CACHE PATH "Path to NDI SDK include")
+    set(NDI_SDK_LIB "$ENV{HOME}/src/NDI SDK for Linux/lib/x86_64-linux-gnu" CACHE PATH "Path to NDI SDK lib")
+    set(FFMPEG_INCLUDE "/usr/include/ffmpeg" CACHE PATH "Path to FFmpeg includes")
+    set(FFMPEG_LIB_ROOT "/usr" CACHE PATH "Path to FFmpeg root (containing lib)")
 endif()
 
 include_directories(${NDI_SDK_INCLUDE} ${FFMPEG_INCLUDE} include)
@@ -31,6 +37,7 @@ include_directories(${NDI_SDK_INCLUDE} ${FFMPEG_INCLUDE} include)
 set(_ffmpeg_search_paths
     ${FFMPEG_LIB_ROOT}
     ${FFMPEG_LIB_ROOT}/lib
+    ${FFMPEG_LIB_ROOT}/lib64
     ${FFMPEG_LIB_ROOT}/bin
 )
 
@@ -43,19 +50,37 @@ elseif (APPLE)
         # Fallback to system search
         find_library(NDI_LIBRARY NAMES ndi libndi libProcessingNDI ProcessingNDI)
     endif()
+elseif (UNIX AND NOT APPLE)
+    # Linux
+    find_library(NDI_LIBRARY NAMES ndi libndi PATHS ${NDI_SDK_LIB} NO_DEFAULT_PATH)
+    if (NOT NDI_LIBRARY)
+        # Fallback to system search
+        find_library(NDI_LIBRARY NAMES ndi libndi)
+    endif()
 endif()
 
-find_library(AVFORMAT_LIBRARY NAMES avformat PATHS ${_ffmpeg_search_paths} PATH_SUFFIXES lib bin)
-find_library(AVCODEC_LIBRARY NAMES avcodec PATHS ${_ffmpeg_search_paths} PATH_SUFFIXES lib bin)
-find_library(AVUTIL_LIBRARY NAMES avutil PATHS ${_ffmpeg_search_paths} PATH_SUFFIXES lib bin)
-find_library(SWSCALE_LIBRARY NAMES swscale PATHS ${_ffmpeg_search_paths} PATH_SUFFIXES lib bin)
-find_library(SWRESAMPLE_LIBRARY NAMES swresample PATHS ${_ffmpeg_search_paths} PATH_SUFFIXES lib bin)
+if (UNIX AND NOT APPLE)
+    # Linux: search in lib64 directly, try both unversioned and versioned names
+    find_library(AVFORMAT_LIBRARY NAMES avformat libavformat.so.61 libavformat.so PATHS ${_ffmpeg_search_paths})
+    find_library(AVCODEC_LIBRARY NAMES avcodec libavcodec.so.61 libavcodec.so PATHS ${_ffmpeg_search_paths})
+    find_library(AVUTIL_LIBRARY NAMES avutil libavutil.so.59 libavutil.so PATHS ${_ffmpeg_search_paths})
+    find_library(SWSCALE_LIBRARY NAMES swscale libswscale.so.8 libswscale.so PATHS ${_ffmpeg_search_paths})
+    find_library(SWRESAMPLE_LIBRARY NAMES swresample libswresample.so.5 libswresample.so PATHS ${_ffmpeg_search_paths})
+else()
+    find_library(AVFORMAT_LIBRARY NAMES avformat PATHS ${_ffmpeg_search_paths} PATH_SUFFIXES lib bin)
+    find_library(AVCODEC_LIBRARY NAMES avcodec PATHS ${_ffmpeg_search_paths} PATH_SUFFIXES lib bin)
+    find_library(AVUTIL_LIBRARY NAMES avutil PATHS ${_ffmpeg_search_paths} PATH_SUFFIXES lib bin)
+    find_library(SWSCALE_LIBRARY NAMES swscale PATHS ${_ffmpeg_search_paths} PATH_SUFFIXES lib bin)
+    find_library(SWRESAMPLE_LIBRARY NAMES swresample PATHS ${_ffmpeg_search_paths} PATH_SUFFIXES lib bin)
+endif()
 
 if (NOT NDI_LIBRARY)
     if (WIN32)
         message(FATAL_ERROR "Could not find Processing.NDI.Lib.x64. Set NDI_SDK_LIB to the NDI SDK library directory (lib or bin).")
-    else()
+    elseif (APPLE)
         message(FATAL_ERROR "Could not find NDI library. Expected location: ${NDI_SDK_LIB}/libndi.dylib. Set NDI_SDK_LIB to the NDI SDK library directory.")
+    else()
+        message(FATAL_ERROR "Could not find NDI library. Expected location: ${NDI_SDK_LIB}/libndi.so. Set NDI_SDK_LIB to the NDI SDK library directory.")
     endif()
 endif()
 if (NOT AVFORMAT_LIBRARY)

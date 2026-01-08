@@ -17,7 +17,10 @@ Logger::Logger()
 {
     QDir().mkpath("logs");
     m_file.setFileName("logs/app.log");
-    m_file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text);
+    if (!m_file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+        // Log file couldn't be opened, but continue anyway
+        QTextStream(stderr) << "Warning: Could not open log file: " << m_file.fileName() << "\n";
+    }
 }
 
 void Logger::setVerbose(bool enabled)

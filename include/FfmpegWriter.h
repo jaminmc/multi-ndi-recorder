@@ -72,6 +72,7 @@ public:
 
     QString currentFile() const { return m_currentFile; }
     AVRational videoTimeBase() const;
+    QString lastError() const { return m_lastError; }
     
     // Static function to query available H.264 and HEVC encoders
     static QVector<QString> getAvailableEncoders();
@@ -104,6 +105,8 @@ private:
     QVector<AudioStreamInfo> m_audioStreams;
     SwsContext *m_sws;
     AVFrame *m_convertedFrame;
+    AVFrame *m_hwFrame; // Hardware frame for VAAPI
+    AVBufferRef *m_hwFramesCtx; // Hardware frames context for VAAPI
     qint64 m_startMs;
     
     // Video metadata from NDI
@@ -111,6 +114,7 @@ private:
     float m_ndiPictureAspectRatio;
     QString m_ndiMetadata;
     QString m_currentFile;
+    QString m_lastError; // Last error message for user display
     QMutex m_mutex;
     int m_segmentIndex;
     int m_inputWidth;

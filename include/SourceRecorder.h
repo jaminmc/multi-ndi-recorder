@@ -65,7 +65,7 @@ public:
     void stop();
 
     QImage lastFrame() const;
-    QString status() const { return m_status; }
+    QString status() const;
     qint64 elapsedMs() const;
     QString currentFile() const { return m_writer.currentFile(); }
 

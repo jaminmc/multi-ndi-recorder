@@ -24,11 +24,12 @@ A Qt 6 desktop utility for Windows, macOS, and Linux that records multiple NDI s
 - **FFmpeg dev libraries**: install via Homebrew (`brew install ffmpeg`) or build from source.
 
 ### Linux
-- **Ubuntu 20.04+ / Debian 11+ / Fedora 34+** or equivalent distribution
-- **Qt 6 (Widgets)**: install via package manager (`sudo apt install qt6-base-dev qt6-base-dev-tools` on Debian/Ubuntu, or `sudo dnf install qt6-qtbase-devel` on Fedora)
-- **NDI 6 SDK**: download and install the Linux version. Default installation path is `/usr/local/ndi`.
-- **FFmpeg dev libraries**: install via package manager (`sudo apt install libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev` on Debian/Ubuntu, or `sudo dnf install ffmpeg-devel` on Fedora)
+- **Ubuntu 20.04+ / Debian 11+ / Fedora 34+ / Arch Linux / openSUSE** or equivalent distribution
+- **Qt 6 (Widgets)**: install via package manager (`sudo apt install qt6-base-dev qt6-base-dev-tools` on Debian/Ubuntu, `sudo dnf install qt6-qtbase-devel` on Fedora, `sudo pacman -S qt6-base` on Arch, or `sudo zypper install qt6-qtbase-devel` on openSUSE)
+- **NDI 6 SDK**: download and install the Linux version. The build system will look for it at `$HOME/src/NDI SDK for Linux` by default.
+- **FFmpeg dev libraries**: install via package manager (`sudo apt install libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev` on Debian/Ubuntu, `sudo dnf install ffmpeg-devel` on Fedora, `sudo pacman -S ffmpeg` on Arch, or `sudo zypper install ffmpeg-devel` on openSUSE)
 - **Python 3 with Pillow**: required for Windows icon generation (`pip3 install Pillow`)
+- **VAAPI support** (optional): For hardware-accelerated encoding with `h264_vaapi` or `hevc_vaapi`, ensure your system has VAAPI drivers installed
 
 ## Configure and build
 
@@ -105,30 +106,57 @@ A Qt 6 desktop utility for Windows, macOS, and Linux that records multiple NDI s
    git clone <repo-url>
    cd multi-ndi-recorder
    ```
-2. Configure CMake with your dependency paths (adjust as needed):
+2. Install dependencies (recommended):
    ```bash
-   cmake -S . -B build \
-     -DNDI_SDK_INCLUDE="/usr/local/ndi/include" \
-     -DNDI_SDK_LIB="/usr/local/ndi/lib/x86_64-linux-gnu" \
-     -DFFMPEG_INCLUDE="/usr/include" \
-     -DFFMPEG_LIB_ROOT="/usr" \
-     -DCMAKE_PREFIX_PATH="/usr/lib/x86_64-linux-gnu/cmake/Qt6"
+   ./install_dependencies.sh
    ```
-   > Paths may vary by distribution. Adjust based on where Qt 6, NDI SDK, and FFmpeg are installed.
-3. Build the application:
+   > This script automatically detects your Linux distribution and installs the required packages. Supported distributions: Fedora/RHEL, Debian/Ubuntu, Arch Linux, and openSUSE.
+   
+   Alternatively, install dependencies manually:
+   - **Fedora/RHEL**: `sudo dnf install ffmpeg-devel qt6-qtbase-devel qt6-qtbase-devel-tools`
+   - **Debian/Ubuntu**: `sudo apt install libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev qt6-base-dev qt6-base-dev-tools`
+   - **Arch Linux**: `sudo pacman -S ffmpeg qt6-base`
+   - **openSUSE**: `sudo zypper install ffmpeg-devel qt6-qtbase-devel qt6-qtbase-devel-tools`
+3. Install the NDI SDK:
+   - Download the NDI SDK for Linux from the NewTek website
+   - Extract it to `$HOME/src/NDI SDK for Linux` (or update the paths in CMakeLists.txt)
+   - The default paths assume: `$HOME/src/NDI SDK for Linux/include` and `$HOME/src/NDI SDK for Linux/lib/x86_64-linux-gnu`
+4. Configure CMake (paths are auto-detected, but can be overridden):
    ```bash
-   cmake --build build --config Release
+   cmake -S . -B build
    ```
-4. Install the application (optional, for desktop integration):
+   > The build system automatically detects:
+   > - NDI SDK at `$HOME/src/NDI SDK for Linux`
+   > - FFmpeg headers at `/usr/include/ffmpeg` (Fedora) or `/usr/include` (other distros)
+   > - FFmpeg libraries at `/usr/lib64` (Fedora) or `/usr/lib` (other distros)
+   > 
+   > To override defaults, use:
+   > ```bash
+   > cmake -S . -B build \
+   >   -DNDI_SDK_INCLUDE="/path/to/ndi/include" \
+   >   -DNDI_SDK_LIB="/path/to/ndi/lib/x86_64-linux-gnu" \
+   >   -DFFMPEG_INCLUDE="/usr/include/ffmpeg" \
+   >   -DFFMPEG_LIB_ROOT="/usr"
+   > ```
+5. Build the application:
+   ```bash
+   cmake --build build -j$(nproc)
+   ```
+6. Install the application (optional, for desktop integration):
    ```bash
    sudo cmake --install build --prefix /usr/local
    ```
    > This installs the executable, desktop file, and icon for system-wide access.
-5. Run the app:
+7. Run the app:
    ```bash
    build/MultiNdiRecorder
    ```
    > Or if installed: `MultiNdiRecorder` (should appear in your application menu)
+   
+   **Note**: If using VAAPI hardware encoding (`h264_vaapi` or `hevc_vaapi`), ensure your system has VAAPI drivers installed and the NDI library is accessible:
+   ```bash
+   export LD_LIBRARY_PATH="$HOME/src/NDI SDK for Linux/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
+   ```
 
 ## Using the application
 1. **Set source count**: Use the spin box at the top to choose how many NDI tiles to display (1–10). Tiles show preview, status, and an elapsed timer.
@@ -154,7 +182,11 @@ The application features a modernized UI with:
   - NDI and FFmpeg libraries must be in the system library path (e.g., `/usr/local/lib`) or the app's bundle. You may need to set `DYLD_LIBRARY_PATH` if libraries are in non-standard locations.
   - The build creates a proper `.app` bundle with an icon. If the icon doesn't appear, ensure `icons/app_icon.icns` exists (run `icons/generate_icon.sh`).
 - **Linux**: 
-  - NDI and FFmpeg libraries must be in the system library path (e.g., `/usr/lib` or `/usr/local/lib`). You may need to set `LD_LIBRARY_PATH` if libraries are in non-standard locations.
+  - NDI and FFmpeg libraries must be in the system library path (e.g., `/usr/lib` or `/usr/local/lib`). You may need to set `LD_LIBRARY_PATH` if libraries are in non-standard locations:
+    ```bash
+    export LD_LIBRARY_PATH="$HOME/src/NDI SDK for Linux/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
+    ```
   - For desktop integration, install the application (`sudo cmake --install build`) which installs the `.desktop` file and icon.
   - The application will appear in your application menu after installation.
+  - **VAAPI Hardware Encoding**: The application supports hardware-accelerated encoding using VAAPI (`h264_vaapi`, `hevc_vaapi`). Ensure your system has VAAPI drivers installed (usually provided by Mesa or Intel/AMD GPU drivers). The build system automatically sets up the required hardware contexts for VAAPI encoding.
 - For best disk stability, record to fast local storage rather than network shares.

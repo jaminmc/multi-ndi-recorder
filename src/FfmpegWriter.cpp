@@ -9,15 +9,16 @@
 #include <cstring>
 #include <cmath>
 #include <libavutil/rational.h>
+#include <libavutil/hwcontext.h>
 
 FfmpegWriter::FfmpegWriter()
     : m_fmtCtx(nullptr), m_videoStream(nullptr), m_videoCodecCtx(nullptr),
-      m_sws(nullptr), m_convertedFrame(nullptr),
+      m_sws(nullptr), m_convertedFrame(nullptr), m_hwFrame(nullptr), m_hwFramesCtx(nullptr),
       m_startMs(0), m_segmentIndex(1), m_inputWidth(0), m_inputHeight(0), m_inputFormat(AV_PIX_FMT_NONE),
       m_audioSampleRate(48000), m_currentAudioChannels(0), m_headerWritten(false),
       m_videoFramesWritten(0), m_syncTimestamp(0), m_firstVideoPts(0), m_lastVideoPts(AV_NOPTS_VALUE), m_firstAudioPts(0),
       m_firstVideoFrameWritten(false), m_firstAudioFrameWritten(false), m_waitingForAudio(false),
-      m_videoFramesBeforeHeaderWrite(0)
+      m_videoFramesBeforeHeaderWrite(0), m_lastError()
 {
     avformat_network_init();
 }
@@ -111,6 +112,45 @@ AVRational FfmpegWriter::videoTimeBase() const
 bool FfmpegWriter::start(const RecordingConfig &cfg)
 {
     QMutexLocker locker(&m_mutex);
+    m_lastError.clear(); // Clear previous error
+    
+    // If codec changed, reset video stream to force recreation
+    bool codecChanged = (m_cfg.videoCodec != cfg.videoCodec);
+    if (codecChanged && m_videoCodecCtx)
+    {
+        // Codec changed - clean up old codec context
+        if (m_videoCodecCtx->hw_frames_ctx)
+        {
+            av_buffer_unref(&m_videoCodecCtx->hw_frames_ctx);
+        }
+        if (m_videoCodecCtx->hw_device_ctx)
+        {
+            av_buffer_unref(&m_videoCodecCtx->hw_device_ctx);
+        }
+        avcodec_free_context(&m_videoCodecCtx);
+        m_videoCodecCtx = nullptr;
+        m_videoStream = nullptr;
+        if (m_hwFramesCtx)
+        {
+            av_buffer_unref(&m_hwFramesCtx);
+            m_hwFramesCtx = nullptr;
+        }
+        if (m_hwFrame)
+        {
+            av_frame_free(&m_hwFrame);
+            m_hwFrame = nullptr;
+        }
+        // Reset conversion context too
+        if (m_sws)
+        {
+            sws_freeContext(m_sws);
+            m_sws = nullptr;
+        }
+        m_inputWidth = 0;
+        m_inputHeight = 0;
+        m_inputFormat = AV_PIX_FMT_NONE;
+    }
+    
     m_cfg = cfg;
     m_segmentIndex = 1;
     QDir().mkpath(cfg.outputFolder);
@@ -118,6 +158,9 @@ bool FfmpegWriter::start(const RecordingConfig &cfg)
     if (!openContext(nextFile))
     {
         m_currentFile.clear();
+        if (m_lastError.isEmpty()) {
+            m_lastError = "Failed to open output file: " + nextFile;
+        }
         return false;
     }
     m_currentFile = nextFile;
@@ -161,6 +204,11 @@ void FfmpegWriter::closeContext()
                     frameSize = 1024;
                 
                 int numChannels = audioInfo.codecCtx->ch_layout.nb_channels;
+                if (numChannels <= 0)
+                {
+                    Logger::instance().log("ERROR: Invalid channel count in audio flush");
+                    continue;
+                }
                 int remainingSamples = audioInfo.sampleBuffer.size() / numChannels;
                 
                 if (remainingSamples > 0 && audioInfo.frame)
@@ -198,8 +246,12 @@ void FfmpegWriter::closeContext()
             }
         }
         
-        av_write_trailer(m_fmtCtx);
-        if (!(m_fmtCtx->oformat->flags & AVFMT_NOFILE))
+        // Only write trailer if header was written
+        if (m_headerWritten)
+        {
+            av_write_trailer(m_fmtCtx);
+        }
+        if (!(m_fmtCtx->oformat->flags & AVFMT_NOFILE) && m_fmtCtx->pb)
         {
             avio_closep(&m_fmtCtx->pb);
         }
@@ -208,6 +260,15 @@ void FfmpegWriter::closeContext()
     m_fmtCtx = nullptr;
     if (m_videoCodecCtx)
     {
+        // Clean up hardware frames context reference in codec context before freeing
+        if (m_videoCodecCtx->hw_frames_ctx)
+        {
+            av_buffer_unref(&m_videoCodecCtx->hw_frames_ctx);
+        }
+        if (m_videoCodecCtx->hw_device_ctx)
+        {
+            av_buffer_unref(&m_videoCodecCtx->hw_device_ctx);
+        }
         avcodec_free_context(&m_videoCodecCtx);
         m_videoCodecCtx = nullptr;
     }
@@ -238,6 +299,14 @@ void FfmpegWriter::closeContext()
     {
         av_frame_free(&m_convertedFrame);
     }
+    if (m_hwFrame)
+    {
+        av_frame_free(&m_hwFrame);
+    }
+    if (m_hwFramesCtx)
+    {
+        av_buffer_unref(&m_hwFramesCtx);
+    }
 }
 
 void FfmpegWriter::stop()
@@ -258,6 +327,7 @@ void FfmpegWriter::stop()
     m_ndiColorFormat = 0;
     m_ndiPictureAspectRatio = 0.0f;
     m_ndiMetadata = QString();
+    m_lastError.clear(); // Clear error state when stopping
 }
 
 bool FfmpegWriter::prepareVideoStream(int width, int height)
@@ -267,14 +337,57 @@ bool FfmpegWriter::prepareVideoStream(int width, int height)
     
     QMutexLocker locker(&m_mutex);
     
+    // Clear previous error when attempting to prepare a new stream
+    m_lastError.clear();
+    
     if (m_headerWritten)
     {
         Logger::instance().log("Cannot prepare video stream after header is written");
+        m_lastError = "Cannot prepare video stream after header is written";
         return false;
     }
     
+    // If codec context exists, check if codec matches current config
+    // If codec changed, we need to recreate the stream
     if (m_videoCodecCtx && m_videoStream)
-        return true; // Already prepared
+    {
+        // Check if the codec name matches - if not, we need to recreate
+        QString currentCodec = m_cfg.videoCodec.trimmed().toLower();
+        QString existingCodec = "";
+        if (m_videoCodecCtx->codec && m_videoCodecCtx->codec->name)
+        {
+            existingCodec = QString::fromUtf8(m_videoCodecCtx->codec->name).toLower();
+        }
+        
+        // If codec matches, we're good
+        if (existingCodec == currentCodec || existingCodec.contains(currentCodec) || currentCodec.contains(existingCodec))
+        {
+            return true; // Already prepared with correct codec
+        }
+        
+        // Codec changed - need to recreate
+        Logger::instance().log(QString("Codec changed from %1 to %2, recreating video stream").arg(existingCodec).arg(currentCodec));
+        if (m_videoCodecCtx->hw_frames_ctx)
+        {
+            av_buffer_unref(&m_videoCodecCtx->hw_frames_ctx);
+        }
+        if (m_videoCodecCtx->hw_device_ctx)
+        {
+            av_buffer_unref(&m_videoCodecCtx->hw_device_ctx);
+        }
+        avcodec_free_context(&m_videoCodecCtx);
+        m_videoStream = nullptr;
+        if (m_hwFramesCtx)
+        {
+            av_buffer_unref(&m_hwFramesCtx);
+            m_hwFramesCtx = nullptr;
+        }
+        if (m_hwFrame)
+        {
+            av_frame_free(&m_hwFrame);
+            m_hwFrame = nullptr;
+        }
+    }
     
     // Select codec based on configuration (hardware detection is now automatic from codec name)
     CodecInfo codecInfo = selectCodec(m_cfg.videoCodec, false);
@@ -298,6 +411,8 @@ bool FfmpegWriter::prepareVideoStream(int width, int height)
     m_videoStream = avformat_new_stream(m_fmtCtx, videoCodec);
     if (!m_videoStream)
     {
+        QString errorMsg = "Failed to create video stream";
+        m_lastError = errorMsg;
         Logger::instance().log("Failed to create video stream");
         return false;
     }
@@ -307,7 +422,31 @@ bool FfmpegWriter::prepareVideoStream(int width, int height)
     m_videoCodecCtx->codec_id = codecInfo.id;
     m_videoCodecCtx->width = width > 0 ? width : m_cfg.width;
     m_videoCodecCtx->height = height > 0 ? height : m_cfg.height;
-    m_videoCodecCtx->pix_fmt = selectPixelFormat(codecInfo.isHardware, isHEVC, m_cfg.outputPixFmt);
+    
+    // Select pixel format - for hardware encoders, use appropriate hardware format
+    QString normalizedCodec = m_cfg.videoCodec.trimmed().toLower();
+    bool isVAAPI = normalizedCodec.contains("vaapi");
+    bool isVulkan = normalizedCodec.contains("vulkan");
+    AVPixelFormat selectedPixFmt;
+    
+    if (isVAAPI)
+    {
+        // VAAPI encoders require AV_PIX_FMT_VAAPI (hardware surface format)
+        selectedPixFmt = AV_PIX_FMT_VAAPI;
+        Logger::instance().log("VAAPI: Using AV_PIX_FMT_VAAPI pixel format");
+    }
+    else if (isVulkan)
+    {
+        // Vulkan encoders require AV_PIX_FMT_VULKAN (hardware surface format)
+        selectedPixFmt = AV_PIX_FMT_VULKAN;
+        Logger::instance().log("Vulkan: Using AV_PIX_FMT_VULKAN pixel format");
+    }
+    else
+    {
+        selectedPixFmt = selectPixelFormat(codecInfo.isHardware, isHEVC, m_cfg.outputPixFmt);
+    }
+    
+    m_videoCodecCtx->pix_fmt = selectedPixFmt;
     m_videoCodecCtx->time_base = {m_cfg.fpsDen, m_cfg.fpsNum};
     m_videoCodecCtx->framerate = {m_cfg.fpsNum, m_cfg.fpsDen};
     m_videoCodecCtx->gop_size = m_cfg.fps;
@@ -321,6 +460,116 @@ bool FfmpegWriter::prepareVideoStream(int width, int height)
     if (m_fmtCtx->oformat->flags & AVFMT_GLOBALHEADER)
         m_videoCodecCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     
+    // Setup hardware device context and frames context for hardware encoders
+    if (isVAAPI)
+    {
+        AVBufferRef *hw_device_ctx = nullptr;
+        int ret = av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_VAAPI, nullptr, nullptr, 0);
+        if (ret < 0)
+        {
+            char errbuf[256];
+            av_strerror(ret, errbuf, sizeof(errbuf));
+            Logger::instance().log(QString("ERROR: Failed to create VAAPI device context: %1").arg(errbuf));
+            avcodec_free_context(&m_videoCodecCtx);
+            return false;
+        }
+        
+        m_videoCodecCtx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
+        
+        // Create hardware frames context
+        m_hwFramesCtx = av_hwframe_ctx_alloc(hw_device_ctx);
+        if (!m_hwFramesCtx)
+        {
+            Logger::instance().log("ERROR: Failed to allocate VAAPI hardware frames context");
+            av_buffer_unref(&hw_device_ctx);
+            avcodec_free_context(&m_videoCodecCtx);
+            return false;
+        }
+        
+        AVHWFramesContext *frames_ctx = (AVHWFramesContext *)m_hwFramesCtx->data;
+        frames_ctx->format = AV_PIX_FMT_VAAPI;
+        frames_ctx->sw_format = AV_PIX_FMT_NV12;
+        frames_ctx->width = m_videoCodecCtx->width;
+        frames_ctx->height = m_videoCodecCtx->height;
+        
+        ret = av_hwframe_ctx_init(m_hwFramesCtx);
+        if (ret < 0)
+        {
+            char errbuf[256];
+            av_strerror(ret, errbuf, sizeof(errbuf));
+            Logger::instance().log(QString("ERROR: Failed to initialize VAAPI hardware frames context: %1").arg(errbuf));
+            av_buffer_unref(&m_hwFramesCtx);
+            av_buffer_unref(&hw_device_ctx);
+            avcodec_free_context(&m_videoCodecCtx);
+            return false;
+        }
+        
+        m_videoCodecCtx->hw_frames_ctx = av_buffer_ref(m_hwFramesCtx);
+        av_buffer_unref(&hw_device_ctx);
+        Logger::instance().log("VAAPI: Hardware device and frames context created successfully");
+    }
+    else if (isVulkan)
+    {
+        AVBufferRef *hw_device_ctx = nullptr;
+        int ret = av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_VULKAN, nullptr, nullptr, 0);
+        if (ret < 0)
+        {
+            char errbuf[256];
+            av_strerror(ret, errbuf, sizeof(errbuf));
+            QString errorMsg = QString("Vulkan hardware acceleration is not available.\n\n"
+                                      "Error: %1\n\n"
+                                      "Your graphics card may not support Vulkan, or Vulkan drivers may not be installed.\n"
+                                      "Please try using a different codec (e.g., libx264, h264_vaapi) or install Vulkan drivers.").arg(errbuf);
+            m_lastError = errorMsg;
+            Logger::instance().log(QString("ERROR: Failed to create Vulkan device context: %1").arg(errbuf));
+            avcodec_free_context(&m_videoCodecCtx);
+            return false;
+        }
+        
+        m_videoCodecCtx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
+        
+        // Create hardware frames context
+        m_hwFramesCtx = av_hwframe_ctx_alloc(hw_device_ctx);
+        if (!m_hwFramesCtx)
+        {
+            QString errorMsg = QString("Failed to allocate Vulkan hardware frames context.\n\n"
+                                      "Your graphics card may not support Vulkan video encoding.\n"
+                                      "Please try using a different codec (e.g., libx264, h264_vaapi).");
+            m_lastError = errorMsg;
+            Logger::instance().log("ERROR: Failed to allocate Vulkan hardware frames context");
+            av_buffer_unref(&hw_device_ctx);
+            avcodec_free_context(&m_videoCodecCtx);
+            return false;
+        }
+        
+        AVHWFramesContext *frames_ctx = (AVHWFramesContext *)m_hwFramesCtx->data;
+        frames_ctx->format = AV_PIX_FMT_VULKAN;
+        frames_ctx->sw_format = AV_PIX_FMT_NV12;
+        frames_ctx->width = m_videoCodecCtx->width;
+        frames_ctx->height = m_videoCodecCtx->height;
+        
+        ret = av_hwframe_ctx_init(m_hwFramesCtx);
+        if (ret < 0)
+        {
+            char errbuf[256];
+            av_strerror(ret, errbuf, sizeof(errbuf));
+            QString errorMsg = QString("Failed to initialize Vulkan hardware frames context.\n\n"
+                                      "Error: %1\n\n"
+                                      "Your graphics card may not support Vulkan video encoding, or the required features are not available.\n"
+                                      "Please try using a different codec (e.g., libx264, h264_vaapi).").arg(errbuf);
+            m_lastError = errorMsg;
+            Logger::instance().log(QString("ERROR: Failed to initialize Vulkan hardware frames context: %1").arg(errbuf));
+            av_buffer_unref(&m_hwFramesCtx);
+            av_buffer_unref(&hw_device_ctx);
+            avcodec_free_context(&m_videoCodecCtx);
+            return false;
+        }
+        
+        m_videoCodecCtx->hw_frames_ctx = av_buffer_ref(m_hwFramesCtx);
+        av_buffer_unref(&hw_device_ctx);
+        Logger::instance().log("Vulkan: Hardware device and frames context created successfully");
+    }
+    
     // Setup codec options
     AVDictionary *videoOpts = nullptr;
     setupCodecOptions(&videoOpts, m_cfg.videoCodec, codecInfo.isHardware, isHEVC, m_videoCodecCtx->pix_fmt);
@@ -331,6 +580,12 @@ bool FfmpegWriter::prepareVideoStream(int width, int height)
     {
         char errbuf[256];
         av_strerror(ret, errbuf, sizeof(errbuf));
+        QString codecName = QString::fromUtf8(videoCodec->name);
+        QString errorMsg = QString("Failed to open video codec '%1'.\n\nError: %2").arg(codecName).arg(errbuf);
+        if (codecName.contains("vulkan", Qt::CaseInsensitive)) {
+            errorMsg += "\n\nYour graphics card may not support Vulkan video encoding.\nPlease try using a different codec (e.g., libx264, h264_vaapi).";
+        }
+        m_lastError = errorMsg;
         Logger::instance().log(QString("ERROR: Failed to open video codec: %1").arg(errbuf));
         av_dict_free(&videoOpts);
         return false;
@@ -340,6 +595,8 @@ bool FfmpegWriter::prepareVideoStream(int width, int height)
     // Verify codec matches expectations
     if (!verifyCodec(videoCodec, m_videoCodecCtx, m_videoStream, codecInfo))
     {
+        QString errorMsg = QString("Codec verification failed for '%1'").arg(QString::fromUtf8(videoCodec->name));
+        m_lastError = errorMsg;
         avcodec_free_context(&m_videoCodecCtx);
         return false;
     }
@@ -347,6 +604,8 @@ bool FfmpegWriter::prepareVideoStream(int width, int height)
     // Copy parameters to stream
     if (avcodec_parameters_from_context(m_videoStream->codecpar, m_videoCodecCtx) < 0)
     {
+        QString errorMsg = "Failed to copy video codec parameters to stream";
+        m_lastError = errorMsg;
         Logger::instance().log("Failed to copy video params");
         return false;
     }
@@ -396,32 +655,232 @@ bool FfmpegWriter::writeVideoFrame(AVFrame *frame)
         // Use frame dimensions to prepare stream
         if (!prepareVideoStream(frame->width, frame->height))
         {
+            // Error message is already set in prepareVideoStream
             return false;
         }
+    }
+    
+    if (!m_videoCodecCtx)
+    {
+        Logger::instance().log("ERROR: Video codec context is null in writeVideoFrame");
+        return false;
     }
     
     frame->width = m_videoCodecCtx->width;
     frame->height = m_videoCodecCtx->height;
 
-    if (!m_sws || m_inputWidth != frame->width || m_inputHeight != frame->height || m_inputFormat != frame->format)
-    {
-        m_sws = sws_getCachedContext(m_sws, frame->width, frame->height, (AVPixelFormat)frame->format,
-                                     m_videoCodecCtx->width, m_videoCodecCtx->height, m_videoCodecCtx->pix_fmt,
-                                     SWS_BILINEAR, nullptr, nullptr, nullptr);
-        if (!m_sws)
-            return false;
-        m_inputWidth = frame->width;
-        m_inputHeight = frame->height;
-        m_inputFormat = (AVPixelFormat)frame->format;
-    }
+    // Check if we're using hardware encoding (VAAPI or Vulkan)
+    QString normalizedCodec = m_cfg.videoCodec.trimmed().toLower();
+    bool isVAAPI = normalizedCodec.contains("vaapi");
+    bool isVulkan = normalizedCodec.contains("vulkan");
+    AVFrame *frameToEncode = nullptr;
 
-    if (!ensureConvertedFrame())
-        return false;
-    if (av_frame_make_writable(m_convertedFrame) < 0)
-        return false;
-    if (sws_scale(m_sws, frame->data, frame->linesize, 0, frame->height, m_convertedFrame->data, m_convertedFrame->linesize) <= 0)
+    // Check if hardware encoder is properly set up
+    if (isVAAPI && m_videoCodecCtx->pix_fmt == AV_PIX_FMT_VAAPI && m_hwFramesCtx)
     {
-        return false;
+        // VAAPI: Convert to NV12 software frame first, then upload to hardware
+        if (!m_sws || m_inputWidth != frame->width || m_inputHeight != frame->height || m_inputFormat != frame->format)
+        {
+            // Convert to NV12 (software format)
+            m_sws = sws_getCachedContext(m_sws, frame->width, frame->height, (AVPixelFormat)frame->format,
+                                         m_videoCodecCtx->width, m_videoCodecCtx->height, AV_PIX_FMT_NV12,
+                                         SWS_BILINEAR, nullptr, nullptr, nullptr);
+            if (!m_sws)
+                return false;
+            m_inputWidth = frame->width;
+            m_inputHeight = frame->height;
+            m_inputFormat = (AVPixelFormat)frame->format;
+        }
+
+        // Ensure we have a software frame for conversion to NV12
+        if (!m_convertedFrame)
+        {
+            m_convertedFrame = av_frame_alloc();
+            if (!m_convertedFrame)
+                return false;
+        }
+        
+        // Set converted frame properties for NV12
+        m_convertedFrame->format = AV_PIX_FMT_NV12;
+        m_convertedFrame->width = m_videoCodecCtx->width;
+        m_convertedFrame->height = m_videoCodecCtx->height;
+        
+        // Allocate buffer for NV12 frame if needed
+        if (av_frame_get_buffer(m_convertedFrame, 32) < 0)
+        {
+            Logger::instance().log("ERROR: Failed to allocate buffer for NV12 conversion frame");
+            return false;
+        }
+        
+        if (av_frame_make_writable(m_convertedFrame) < 0)
+        {
+            Logger::instance().log("ERROR: Failed to make NV12 frame writable");
+            return false;
+        }
+        
+        // Convert RGBA to NV12
+        if (sws_scale(m_sws, frame->data, frame->linesize, 0, frame->height, m_convertedFrame->data, m_convertedFrame->linesize) <= 0)
+        {
+            Logger::instance().log("ERROR: Failed to convert frame to NV12");
+            return false;
+        }
+
+        // Upload software frame to hardware surface
+        // Allocate hardware frame if needed
+        if (!m_hwFrame)
+        {
+            m_hwFrame = av_frame_alloc();
+            if (!m_hwFrame)
+                return false;
+        }
+        
+        // Unref any existing buffer in the frame before getting a new one
+        av_frame_unref(m_hwFrame);
+        
+        // Get a hardware frame buffer from the frames context
+        if (!m_hwFramesCtx)
+        {
+            Logger::instance().log("ERROR: VAAPI hardware frames context not initialized");
+            return false;
+        }
+        
+        int ret = av_hwframe_get_buffer(m_hwFramesCtx, m_hwFrame, 0);
+        if (ret < 0)
+        {
+            char errbuf[256];
+            av_strerror(ret, errbuf, sizeof(errbuf));
+            Logger::instance().log(QString("ERROR: Failed to get VAAPI hardware frame buffer: %1").arg(errbuf));
+            return false;
+        }
+        
+        // Upload NV12 software frame to VAAPI hardware surface
+        ret = av_hwframe_transfer_data(m_hwFrame, m_convertedFrame, 0);
+        if (ret < 0)
+        {
+            char errbuf[256];
+            av_strerror(ret, errbuf, sizeof(errbuf));
+            Logger::instance().log(QString("ERROR: Failed to upload frame to VAAPI hardware: %1").arg(errbuf));
+            return false;
+        }
+        
+        // Set frame properties for encoding (width/height/format are already set by get_buffer)
+        frameToEncode = m_hwFrame;
+    }
+    else if (isVulkan && m_videoCodecCtx && m_videoCodecCtx->pix_fmt == AV_PIX_FMT_VULKAN && m_hwFramesCtx)
+    {
+        // Vulkan: Convert to NV12 software frame first, then upload to hardware
+        if (!m_sws || m_inputWidth != frame->width || m_inputHeight != frame->height || m_inputFormat != frame->format)
+        {
+            // Convert to NV12 (software format)
+            m_sws = sws_getCachedContext(m_sws, frame->width, frame->height, (AVPixelFormat)frame->format,
+                                         m_videoCodecCtx->width, m_videoCodecCtx->height, AV_PIX_FMT_NV12,
+                                         SWS_BILINEAR, nullptr, nullptr, nullptr);
+            if (!m_sws)
+                return false;
+            m_inputWidth = frame->width;
+            m_inputHeight = frame->height;
+            m_inputFormat = (AVPixelFormat)frame->format;
+        }
+
+        // Ensure we have a software frame for conversion to NV12
+        if (!m_convertedFrame)
+        {
+            m_convertedFrame = av_frame_alloc();
+            if (!m_convertedFrame)
+                return false;
+        }
+        
+        // Set converted frame properties for NV12
+        m_convertedFrame->format = AV_PIX_FMT_NV12;
+        m_convertedFrame->width = m_videoCodecCtx->width;
+        m_convertedFrame->height = m_videoCodecCtx->height;
+        
+        // Allocate buffer for NV12 frame if needed
+        if (av_frame_get_buffer(m_convertedFrame, 32) < 0)
+        {
+            Logger::instance().log("ERROR: Failed to allocate buffer for NV12 conversion frame");
+            return false;
+        }
+        
+        if (av_frame_make_writable(m_convertedFrame) < 0)
+        {
+            Logger::instance().log("ERROR: Failed to make NV12 frame writable");
+            return false;
+        }
+        
+        // Convert RGBA to NV12
+        if (sws_scale(m_sws, frame->data, frame->linesize, 0, frame->height, m_convertedFrame->data, m_convertedFrame->linesize) <= 0)
+        {
+            Logger::instance().log("ERROR: Failed to convert frame to NV12");
+            return false;
+        }
+
+        // Upload software frame to hardware surface
+        // Allocate hardware frame if needed
+        if (!m_hwFrame)
+        {
+            m_hwFrame = av_frame_alloc();
+            if (!m_hwFrame)
+                return false;
+        }
+        
+        // Unref any existing buffer in the frame before getting a new one
+        av_frame_unref(m_hwFrame);
+        
+        // Get a hardware frame buffer from the frames context
+        if (!m_hwFramesCtx)
+        {
+            Logger::instance().log("ERROR: Vulkan hardware frames context not initialized");
+            return false;
+        }
+        
+        int ret = av_hwframe_get_buffer(m_hwFramesCtx, m_hwFrame, 0);
+        if (ret < 0)
+        {
+            char errbuf[256];
+            av_strerror(ret, errbuf, sizeof(errbuf));
+            Logger::instance().log(QString("ERROR: Failed to get Vulkan hardware frame buffer: %1").arg(errbuf));
+            return false;
+        }
+        
+        // Upload NV12 software frame to Vulkan hardware surface
+        ret = av_hwframe_transfer_data(m_hwFrame, m_convertedFrame, 0);
+        if (ret < 0)
+        {
+            char errbuf[256];
+            av_strerror(ret, errbuf, sizeof(errbuf));
+            Logger::instance().log(QString("ERROR: Failed to upload frame to Vulkan hardware: %1").arg(errbuf));
+            return false;
+        }
+        
+        // Set frame properties for encoding (width/height/format are already set by get_buffer)
+        frameToEncode = m_hwFrame;
+    }
+    else
+    {
+        // Non-hardware: Use standard software conversion
+        if (!m_sws || m_inputWidth != frame->width || m_inputHeight != frame->height || m_inputFormat != frame->format)
+        {
+            m_sws = sws_getCachedContext(m_sws, frame->width, frame->height, (AVPixelFormat)frame->format,
+                                         m_videoCodecCtx->width, m_videoCodecCtx->height, m_videoCodecCtx->pix_fmt,
+                                         SWS_BILINEAR, nullptr, nullptr, nullptr);
+            if (!m_sws)
+                return false;
+            m_inputWidth = frame->width;
+            m_inputHeight = frame->height;
+            m_inputFormat = (AVPixelFormat)frame->format;
+        }
+
+        if (!ensureConvertedFrame())
+            return false;
+        if (av_frame_make_writable(m_convertedFrame) < 0)
+            return false;
+        if (sws_scale(m_sws, frame->data, frame->linesize, 0, frame->height, m_convertedFrame->data, m_convertedFrame->linesize) <= 0)
+        {
+            return false;
+        }
+        
+        frameToEncode = m_convertedFrame;
     }
 
     // Use PTS directly from NDI timestamp (already calculated relative to sync point)
@@ -430,7 +889,7 @@ bool FfmpegWriter::writeVideoFrame(AVFrame *frame)
     {
         m_firstVideoPts = frame->pts;
         m_lastVideoPts = frame->pts;
-        m_convertedFrame->pts = frame->pts;
+        frameToEncode->pts = frame->pts;
         m_firstVideoFrameWritten = true;
         Logger::instance().verbose(QString("First video frame PTS: %1").arg(frame->pts));
     }
@@ -441,15 +900,15 @@ bool FfmpegWriter::writeVideoFrame(AVFrame *frame)
         if (frame->pts <= m_lastVideoPts)
         {
             // PTS didn't advance - use incremental PTS instead
-            m_convertedFrame->pts = m_lastVideoPts + 1;
+            frameToEncode->pts = m_lastVideoPts + 1;
             Logger::instance().verbose(QString("PTS didn't advance (frame PTS: %1, last: %2), using incremental: %3")
-                                      .arg(frame->pts).arg(m_lastVideoPts).arg(m_convertedFrame->pts));
-            m_lastVideoPts = m_convertedFrame->pts;
+                                      .arg(frame->pts).arg(m_lastVideoPts).arg(frameToEncode->pts));
+            m_lastVideoPts = frameToEncode->pts;
         }
         else
         {
             // PTS advanced correctly
-            m_convertedFrame->pts = frame->pts;
+            frameToEncode->pts = frame->pts;
             m_lastVideoPts = frame->pts;
         }
     }
@@ -470,7 +929,7 @@ bool FfmpegWriter::writeVideoFrame(AVFrame *frame)
         }
     }
     
-    int ret = avcodec_send_frame(m_videoCodecCtx, m_convertedFrame);
+    int ret = avcodec_send_frame(m_videoCodecCtx, frameToEncode);
     if (ret < 0)
     {
         char errbuf[256];
@@ -544,7 +1003,7 @@ bool FfmpegWriter::writeVideoFrame(AVFrame *frame)
         
         if (pkt->pts == AV_NOPTS_VALUE)
         {
-            pkt->pts = m_convertedFrame->pts;
+            pkt->pts = frameToEncode->pts;
         }
         if (pkt->dts == AV_NOPTS_VALUE)
         {
@@ -631,8 +1090,11 @@ bool FfmpegWriter::writeAudioFrameWithTimestamp(const float *audioData, int numS
         if (!m_audioStreams.isEmpty())
         {
             int numCh = m_audioStreams[0].codecCtx ? m_audioStreams[0].codecCtx->ch_layout.nb_channels : 1;
-            int buffered = m_audioStreams[0].sampleBuffer.size() / numCh;
-            audioPts = m_audioStreams[0].pts + buffered;
+            if (numCh > 0)
+            {
+                int buffered = m_audioStreams[0].sampleBuffer.size() / numCh;
+                audioPts = m_audioStreams[0].pts + buffered;
+            }
         }
     }
     
@@ -657,8 +1119,11 @@ bool FfmpegWriter::writeAudioFrame(const float *audioData, int numSamples, int s
     if (!m_audioStreams.isEmpty())
     {
         int numCh = m_audioStreams[0].codecCtx ? m_audioStreams[0].codecCtx->ch_layout.nb_channels : 1;
-        int buffered = m_audioStreams[0].sampleBuffer.size() / numCh;
-        audioPts = m_audioStreams[0].pts + buffered;
+        if (numCh > 0)
+        {
+            int buffered = m_audioStreams[0].sampleBuffer.size() / numCh;
+            audioPts = m_audioStreams[0].pts + buffered;
+        }
     }
     return writeAudioFrameInternal(audioData, numSamples, sampleRate, numChannels, audioPts);
 }
@@ -1246,6 +1711,11 @@ bool FfmpegWriter::writeAudioToStream(AudioStreamInfo &info, const float *channe
     }
     
     int numChannels = info.codecCtx->ch_layout.nb_channels;
+    if (numChannels <= 0)
+    {
+        Logger::instance().log("ERROR: Invalid channel count in writeAudioToStream");
+        return false;
+    }
     int currentBufferSize = info.sampleBuffer.size();
     int bufferedSamples = currentBufferSize / numChannels;
     
@@ -1487,6 +1957,7 @@ FfmpegWriter::CodecInfo FfmpegWriter::selectCodec(const QString &codecName, bool
                          codecNameLower.contains("_amf") ||
                          codecNameLower.contains("_qsv") ||
                          codecNameLower.contains("_vaapi") ||
+                         codecNameLower.contains("_vulkan") ||
                          codecNameLower.contains("_videotoolbox") ||
                          codecNameLower.contains("_mf") ||
                          codecNameLower.contains("_mediacodec");
@@ -1613,7 +2084,7 @@ AVPixelFormat FfmpegWriter::selectPixelFormat(bool isHardware, bool isHEVC, AVPi
     if (isHEVC && is10Bit)
         return AV_PIX_FMT_P010LE; // HEVC 10-bit
     else
-        return AV_PIX_FMT_NV12; // 8-bit (H.264 or HEVC)
+        return AV_PIX_FMT_NV12; // 8-bit (H.264 or HEVC) - works for most hardware encoders including VAAPI
 }
 
 // Helper function: Setup codec options
@@ -1629,6 +2100,7 @@ void FfmpegWriter::setupCodecOptions(AVDictionary **opts, const QString &codecNa
         bool isQSV = normalizedCodec.contains("qsv");
         bool isAMF = normalizedCodec.contains("amf");
         bool isVAAPI = normalizedCodec.contains("vaapi");
+        bool isVulkan = normalizedCodec.contains("vulkan");
         
         // Common options for hardware encoders
         if (isHEVC)
@@ -1643,7 +2115,7 @@ void FfmpegWriter::setupCodecOptions(AVDictionary **opts, const QString &codecNa
                 av_dict_set(opts, "level", "4.1", 0);
                 av_dict_set(opts, "codec", "hevc", 0);
             }
-            else if (isNVENC || isQSV || isAMF || isVAAPI)
+            else if (isNVENC || isQSV || isAMF || isVAAPI || isVulkan)
             {
                 // Set profile for other hardware encoders if supported
                 if (is10Bit)
@@ -1707,6 +2179,14 @@ void FfmpegWriter::setupCodecOptions(AVDictionary **opts, const QString &codecNa
                 int vaapiQp = qualityValue;
                 if (vaapiQp > 52) vaapiQp = 52;
                 av_dict_set(opts, "qp", QString::number(vaapiQp).toUtf8().constData(), 0);
+                }
+                else if (isVulkan)
+            {
+                // Vulkan: Use CRF-like quality setting
+                // Vulkan encoder typically uses -crf or -qp
+                int vulkanQp = qualityValue;
+                if (vulkanQp > 51) vulkanQp = 51;
+                av_dict_set(opts, "qp", QString::number(vulkanQp).toUtf8().constData(), 0);
                 }
             }
         }

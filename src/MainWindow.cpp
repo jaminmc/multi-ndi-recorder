@@ -87,6 +87,9 @@ void MainWindow::rebuildSources(int count)
             e.size = info.size();
             m_libraryModel->addEntry(e);
         });
+        connect(rec, &SourceRecorder::errorOccurred, this, [this](const QString &error) {
+            QMessageBox::critical(this, "Recording Error", error);
+        });
         int row = i / columns;
         int col = i % columns;
         ui->gridLayout->addWidget(tile, row, col);
@@ -140,7 +143,16 @@ void MainWindow::openRecording()
     QModelIndex idx = ui->libraryTable->currentIndex();
     if (!idx.isValid())
         return;
-    QString path = m_libraryModel->data(m_libraryModel->index(idx.row(), 2), Qt::DisplayRole).toString();
+    // Column 2 is the full path column (0=Source, 1=Filename, 2=Path, 3=Date, 4=Size)
+    int pathColumn = 2;
+    if (pathColumn >= m_libraryModel->columnCount())
+        return;
+    QModelIndex pathIdx = m_libraryModel->index(idx.row(), pathColumn);
+    if (!pathIdx.isValid())
+        return;
+    QString path = m_libraryModel->data(pathIdx, Qt::DisplayRole).toString();
+    if (path.isEmpty())
+        return;
     QDesktopServices::openUrl(QUrl::fromLocalFile(path));
 }
 
@@ -149,7 +161,16 @@ void MainWindow::revealRecording()
     QModelIndex idx = ui->libraryTable->currentIndex();
     if (!idx.isValid())
         return;
-    QString path = m_libraryModel->data(m_libraryModel->index(idx.row(), 2), Qt::DisplayRole).toString();
+    // Column 2 is the full path column (0=Source, 1=Filename, 2=Path, 3=Date, 4=Size)
+    int pathColumn = 2;
+    if (pathColumn >= m_libraryModel->columnCount())
+        return;
+    QModelIndex pathIdx = m_libraryModel->index(idx.row(), pathColumn);
+    if (!pathIdx.isValid())
+        return;
+    QString path = m_libraryModel->data(pathIdx, Qt::DisplayRole).toString();
+    if (path.isEmpty())
+        return;
 #ifdef Q_OS_WIN
     QString cmd = QString("explorer.exe /select,\"%1\"").arg(path);
     system(cmd.toUtf8().constData());

@@ -18,6 +18,7 @@ SourceRecorder::SourceRecorder(QObject *parent)
       m_reusableVideoFrame(nullptr), m_videoInfoLogged(false), m_audioInfoLogged(false), m_metadataSet(false),
       m_syncEstablished(false), m_hasSeenVideo(false), m_hasSeenAudio(false)
 {
+    QMutexLocker locker(&m_mutex);
     m_status = "Idle";
 }
 
@@ -74,13 +75,34 @@ SourceRecorder::~SourceRecorder()
 void SourceRecorder::applySettings(const SourceSettings &settings)
 {
     bool ndiSourceChanged = false;
+    bool codecChanged = false;
     {
         QMutexLocker locker(&m_mutex);
         ndiSourceChanged = (m_settings.ndiSource != settings.ndiSource);
+        codecChanged = (m_settings.videoCodec != settings.videoCodec);
         m_settings = settings;
         if (m_settings.label.isEmpty())
             m_settings.label = m_settings.ndiSource;
+        
+        // Clear error status when settings change
+        if (m_status == "Error")
+        {
+            m_status = "";
+        }
+        // Note: m_status is already protected by m_mutex above
     }
+    
+    // If codec changed, always reset the writer to clear any error state and old codec context
+    if (codecChanged)
+    {
+        // Stop writer to clean up any existing codec contexts
+        m_writer.stop();
+        // Also reset any video stream state
+        m_syncEstablished = false;
+        m_bufferedVideoFrames.clear();
+        m_bufferedAudioFrames.clear();
+    }
+    
     emit settingsChanged();
     
     // If NDI source changed and we're not recording, restart preview
@@ -117,7 +139,10 @@ void SourceRecorder::start()
 
     if (m_settings.ndiSource.isEmpty() || m_settings.outputFolder.isEmpty())
     {
-        m_status = "Missing settings";
+        {
+            QMutexLocker locker(&m_mutex);
+            m_status = "Missing settings";
+        }
         emit errorOccurred("Configure NDI source and output folder before starting.");
         return;
     }
@@ -126,7 +151,10 @@ void SourceRecorder::start()
     NdiManager ndi;
     if (!ndi.availableSources().contains(m_settings.ndiSource))
     {
-        m_status = "Source unavailable";
+        {
+            QMutexLocker locker(&m_mutex);
+            m_status = "Source unavailable";
+        }
         emit errorOccurred("NDI source not found: " + m_settings.ndiSource);
         return;
     }
@@ -143,9 +171,9 @@ void SourceRecorder::start()
     m_hasSeenVideo = false;
     m_hasSeenAudio = false;
     m_previewThrottle.invalidate();
-    m_status = "Connecting";
     {
         QMutexLocker locker(&m_mutex);
+        m_status = "Connecting";
         m_preview = QImage();
     }
     emit previewUpdated();
@@ -183,7 +211,10 @@ void SourceRecorder::startPreview()
 
     if (m_settings.ndiSource.isEmpty())
     {
-        m_status = "No NDI source";
+        {
+            QMutexLocker locker(&m_mutex);
+            m_status = "No NDI source";
+        }
         return;
     }
 
@@ -209,9 +240,9 @@ void SourceRecorder::startPreview()
     m_audioInfoLogged = false;
     m_syncEstablished = false;
     m_previewThrottle.invalidate();
-    m_status = "Connecting";
     {
         QMutexLocker locker(&m_mutex);
+        m_status = "Connecting";
         m_preview = QImage();
     }
     emit previewUpdated();
@@ -274,8 +305,8 @@ void SourceRecorder::stop()
     
     // Move object back to main thread only if we're currently in the worker thread
     // This must be done from the worker thread, so we check thread() first
-    QThread *mainThread = QCoreApplication::instance()->thread();
-    if (thread() != mainThread && thread() == &m_videoThread)
+    QThread *mainThread = QCoreApplication::instance() ? QCoreApplication::instance()->thread() : nullptr;
+    if (mainThread && thread() != mainThread && thread() == &m_videoThread)
     {
         // We're in the worker thread - move back to main thread
         moveToThread(mainThread);
@@ -307,9 +338,9 @@ void SourceRecorder::stop()
     }
     else
     {
-        m_status = "Idle";
         {
             QMutexLocker locker(&m_mutex);
+            m_status = "Idle";
             m_preview = QImage();
         }
         emit previewUpdated();
@@ -328,6 +359,12 @@ QImage SourceRecorder::lastFrame() const
 {
     QMutexLocker locker(&m_mutex);
     return m_preview;
+}
+
+QString SourceRecorder::status() const
+{
+    QMutexLocker locker(&m_mutex);
+    return m_status;
 }
 
 void SourceRecorder::reconnect()
@@ -374,7 +411,7 @@ void SourceRecorder::reconnect()
         QMutexLocker locker(&m_mutex);
         if (m_status == "Connection failed" || m_status == "Error")
         {
-            m_status = m_previewOnly ? "Connecting" : "Connecting";
+            m_status = "Connecting";
         }
     }
 }
@@ -430,7 +467,7 @@ void SourceRecorder::videoThreadFunc()
             continue;
         }
         
-switch (NDIlib_recv_capture_v3((NDIlib_recv_instance_t)m_recv, &videoFrame, &audioFrame, nullptr, 100))
+        switch (NDIlib_recv_capture_v3((NDIlib_recv_instance_t)m_recv, &videoFrame, &audioFrame, nullptr, 100))
         {
         case NDIlib_frame_type_video:
         {
@@ -605,7 +642,27 @@ switch (NDIlib_recv_capture_v3((NDIlib_recv_instance_t)m_recv, &videoFrame, &aud
                 // Write video frame
                 if (!m_writer.writeVideoFrame(frame))
                 {
-                    Logger::instance().log("Failed to write video frame");
+                    // Check if there's a specific error message (e.g., Vulkan initialization failed)
+                    QString errorMsg = m_writer.lastError();
+                    if (!errorMsg.isEmpty())
+                    {
+                        // Save error message - stop() will clear it, but we've already saved it
+                        // Stop recording and show error
+                        m_running = false;
+                        m_recordingStarted = false;
+                        m_writer.stop();
+                        {
+                            QMutexLocker locker(&m_mutex);
+                            m_status = "Error";
+                        }
+                        emit errorOccurred(errorMsg);
+                        Logger::instance().log("Failed to write video frame - recording stopped");
+                        break; // Exit the loop to stop processing frames
+                    }
+                    else
+                    {
+                        Logger::instance().log("Failed to write video frame");
+                    }
                 }
                 // Note: Don't free frame here - it's reused
 
@@ -668,6 +725,13 @@ switch (NDIlib_recv_capture_v3((NDIlib_recv_instance_t)m_recv, &videoFrame, &aud
                 // NDI v3 audio frames are PLANAR (FLTP format) by default
                 // Convert to interleaved for buffering
                 bool isPlanar = (audioFrame.FourCC == NDIlib_FourCC_audio_type_FLTP);
+                // Validate channel_stride_in_bytes before division
+                if (audioFrame.channel_stride_in_bytes <= 0 || audioFrame.channel_stride_in_bytes % sizeof(float) != 0)
+                {
+                    Logger::instance().log(QString("ERROR: Invalid channel_stride_in_bytes: %1").arg(audioFrame.channel_stride_in_bytes));
+                    NDIlib_recv_free_audio_v3((NDIlib_recv_instance_t)m_recv, &audioFrame);
+                    break;
+                }
                 int channelStride = audioFrame.channel_stride_in_bytes / sizeof(float);
                 
                 BufferedAudioFrame buffered;
@@ -741,6 +805,13 @@ switch (NDIlib_recv_capture_v3((NDIlib_recv_instance_t)m_recv, &videoFrame, &aud
                             // Planar format: each channel stored separately with stride
                             // Channel 0: p_data[0] to p_data[channelStride-1]
                             // Channel 1: p_data[channelStride] to p_data[2*channelStride-1]
+                            // Validate channel_stride_in_bytes before division
+                            if (audioFrame.channel_stride_in_bytes <= 0 || audioFrame.channel_stride_in_bytes % sizeof(float) != 0)
+                            {
+                                Logger::instance().log(QString("ERROR: Invalid channel_stride_in_bytes in retry: %1").arg(audioFrame.channel_stride_in_bytes));
+                                NDIlib_recv_free_audio_v3((NDIlib_recv_instance_t)m_recv, &audioFrame);
+                                break;
+                            }
                             int channelStride = audioFrame.channel_stride_in_bytes / sizeof(float);
                             interleavedData.resize(numSamples * numChannels);
                             const float *p_data = (const float *)audioFrame.p_data;
@@ -777,6 +848,13 @@ switch (NDIlib_recv_capture_v3((NDIlib_recv_instance_t)m_recv, &videoFrame, &aud
                                 if (isPlanar && interleavedData.isEmpty())
                                 {
                                     // Re-convert if needed
+                                    // Validate channel_stride_in_bytes before division
+                                    if (audioFrame.channel_stride_in_bytes <= 0 || audioFrame.channel_stride_in_bytes % sizeof(float) != 0)
+                                    {
+                                        Logger::instance().log(QString("ERROR: Invalid channel_stride_in_bytes in retry conversion: %1").arg(audioFrame.channel_stride_in_bytes));
+                                        NDIlib_recv_free_audio_v3((NDIlib_recv_instance_t)m_recv, &audioFrame);
+                                        break;
+                                    }
                                     int channelStride = audioFrame.channel_stride_in_bytes / sizeof(float);
                                     interleavedData.resize(numSamples * numChannels);
                                     const float *p_data = (const float *)audioFrame.p_data;
@@ -849,8 +927,8 @@ switch (NDIlib_recv_capture_v3((NDIlib_recv_instance_t)m_recv, &videoFrame, &aud
     }
     
     // Before thread exits, move object back to main thread
-    QThread *mainThread = QCoreApplication::instance()->thread();
-    if (thread() == &m_videoThread && mainThread)
+    QThread *mainThread = QCoreApplication::instance() ? QCoreApplication::instance()->thread() : nullptr;
+    if (mainThread && thread() == &m_videoThread)
     {
         moveToThread(mainThread);
         // Emit final status update after moving back to main thread
@@ -1115,9 +1193,21 @@ void SourceRecorder::establishSyncAndStartRecording()
     }
 
     if (!m_writer.start(cfg)) {
-        m_status = "Error";
-        emit errorOccurred("Failed to start writer for " + m_settings.label);
+        // Save error message BEFORE stopping (stop() clears it)
+        QString errorMsg = m_writer.lastError();
+        if (errorMsg.isEmpty()) {
+            errorMsg = "Failed to start writer for " + m_settings.label;
+        }
+        
+        // Stop recording and clean up before showing error
         m_running = false;
+        m_recordingStarted = false;
+        m_writer.stop(); // Ensure writer is fully stopped and cleaned up
+        {
+            QMutexLocker locker(&m_mutex);
+            m_status = "Error";
+        }
+        emit errorOccurred(errorMsg);
         return;
     }
 
@@ -1138,7 +1228,22 @@ void SourceRecorder::establishSyncAndStartRecording()
         const auto &firstVideo = m_bufferedVideoFrames.first();
         if (!m_writer.prepareVideoStream(firstVideo.width, firstVideo.height))
         {
+            // Save error message BEFORE stopping (stop() clears it)
+            QString errorMsg = m_writer.lastError();
+            if (errorMsg.isEmpty()) {
+                errorMsg = "Failed to prepare video stream";
+            }
+            
+            // Stop recording and clean up before showing error
+            m_running = false;
+            m_recordingStarted = false;
+            m_writer.stop(); // Ensure writer is fully stopped and cleaned up
             Logger::instance().log("Failed to prepare video stream before sync flush");
+            {
+                QMutexLocker locker(&m_mutex);
+                m_status = "Error";
+            }
+            emit errorOccurred(errorMsg);
             return;
         }
     }
