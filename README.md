@@ -1,6 +1,6 @@
 # Multi NDI Recorder
 
-A Qt 6 desktop utility for Windows and macOS that records multiple NDI sources in parallel with continuous or segmented MP4 output and a built-in recordings browser.
+A Qt 6 desktop utility for Windows, macOS, and Linux that records multiple NDI sources in parallel with continuous or segmented MP4 output and a built-in recordings browser.
 
 ## Features at a glance
 - Configure 1–10 NDI inputs, each with preview, start/stop/pause controls, and a per-source timer; global Start/Pause/Stop manage every recorder at once.
@@ -23,6 +23,13 @@ A Qt 6 desktop utility for Windows and macOS that records multiple NDI sources i
 - **NDI 6 SDK**: download and install the macOS version. Default installation path is `/Library/NDI SDK for Apple`.
 - **FFmpeg dev libraries**: install via Homebrew (`brew install ffmpeg`) or build from source.
 
+### Linux
+- **Ubuntu 20.04+ / Debian 11+ / Fedora 34+** or equivalent distribution
+- **Qt 6 (Widgets)**: install via package manager (`sudo apt install qt6-base-dev qt6-base-dev-tools` on Debian/Ubuntu, or `sudo dnf install qt6-qtbase-devel` on Fedora)
+- **NDI 6 SDK**: download and install the Linux version. Default installation path is `/usr/local/ndi`.
+- **FFmpeg dev libraries**: install via package manager (`sudo apt install libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev` on Debian/Ubuntu, or `sudo dnf install ffmpeg-devel` on Fedora)
+- **Python 3 with Pillow**: required for Windows icon generation (`pip3 install Pillow`)
+
 ## Configure and build
 
 ### Windows
@@ -32,7 +39,14 @@ A Qt 6 desktop utility for Windows and macOS that records multiple NDI sources i
    git clone <repo-url>
    cd multi-ndi-recorder
    ```
-3. Configure CMake with your dependency paths (adjust as needed):
+3. Generate the app icon (optional but recommended):
+   ```powershell
+   cd icons
+   python create_ico.py
+   cd ..
+   ```
+   > This creates `icons/app_icon.ico` which will be embedded in the executable. Requires Python 3 with Pillow (`pip install Pillow`).
+4. Configure CMake with your dependency paths (adjust as needed):
    ```powershell
    cmake -S . -B build -G "Ninja" \
      -DNDI_SDK_INCLUDE="C:/Program Files/NDI SDK/Include" \
@@ -42,14 +56,15 @@ A Qt 6 desktop utility for Windows and macOS that records multiple NDI sources i
      -DCMAKE_PREFIX_PATH="C:/Qt/6.5.2/msvc2019_64/lib/cmake"
    ```
    > You can replace `Ninja` with `"Visual Studio 17 2022" -A x64` if you prefer an IDE solution.
-4. Build the application:
+5. Build the application:
    ```powershell
    cmake --build build --config Release
    ```
-5. Run the app:
+6. Run the app:
    ```powershell
    build/Release/MultiNdiRecorder.exe
    ```
+   > The Windows executable will have the application icon embedded if `icons/app_icon.ico` exists.
 
 ### macOS
 1. Clone this repository and enter it:
@@ -84,6 +99,37 @@ A Qt 6 desktop utility for Windows and macOS that records multiple NDI sources i
    ```
    > The build now creates a proper macOS `.app` bundle that can be distributed and launched like any other macOS application.
 
+### Linux
+1. Clone this repository and enter it:
+   ```bash
+   git clone <repo-url>
+   cd multi-ndi-recorder
+   ```
+2. Configure CMake with your dependency paths (adjust as needed):
+   ```bash
+   cmake -S . -B build \
+     -DNDI_SDK_INCLUDE="/usr/local/ndi/include" \
+     -DNDI_SDK_LIB="/usr/local/ndi/lib/x86_64-linux-gnu" \
+     -DFFMPEG_INCLUDE="/usr/include" \
+     -DFFMPEG_LIB_ROOT="/usr" \
+     -DCMAKE_PREFIX_PATH="/usr/lib/x86_64-linux-gnu/cmake/Qt6"
+   ```
+   > Paths may vary by distribution. Adjust based on where Qt 6, NDI SDK, and FFmpeg are installed.
+3. Build the application:
+   ```bash
+   cmake --build build --config Release
+   ```
+4. Install the application (optional, for desktop integration):
+   ```bash
+   sudo cmake --install build --prefix /usr/local
+   ```
+   > This installs the executable, desktop file, and icon for system-wide access.
+5. Run the app:
+   ```bash
+   build/MultiNdiRecorder
+   ```
+   > Or if installed: `MultiNdiRecorder` (should appear in your application menu)
+
 ## Using the application
 1. **Set source count**: Use the spin box at the top to choose how many NDI tiles to display (1–10). Tiles show preview, status, and an elapsed timer.
 2. **Configure each source**: Click **Settings** on a tile to pick the NDI source, output folder, label, and continuous vs. segmented duration. Press **Refresh** to rescan sources.
@@ -101,7 +147,14 @@ The application features a modernized UI with:
 
 ## Notes and tips
 - Ensure output folders exist and are writable before starting a session.
-- **Windows**: NDI and FFmpeg binaries must be discoverable at run time (e.g., via PATH or next to the executable) so their dependent DLLs load correctly.
-- **macOS**: NDI and FFmpeg libraries must be in the system library path (e.g., `/usr/local/lib`) or the app's bundle. You may need to set `DYLD_LIBRARY_PATH` if libraries are in non-standard locations.
-- **macOS App Bundle**: The build creates a proper `.app` bundle with an icon. If the icon doesn't appear, ensure `icons/app_icon.icns` exists (run `icons/generate_icon.sh`).
+- **Windows**: 
+  - NDI and FFmpeg binaries must be discoverable at run time (e.g., via PATH or next to the executable) so their dependent DLLs load correctly.
+  - The application icon is embedded in the executable if `icons/app_icon.ico` exists (generate with `icons/create_ico.py`).
+- **macOS**: 
+  - NDI and FFmpeg libraries must be in the system library path (e.g., `/usr/local/lib`) or the app's bundle. You may need to set `DYLD_LIBRARY_PATH` if libraries are in non-standard locations.
+  - The build creates a proper `.app` bundle with an icon. If the icon doesn't appear, ensure `icons/app_icon.icns` exists (run `icons/generate_icon.sh`).
+- **Linux**: 
+  - NDI and FFmpeg libraries must be in the system library path (e.g., `/usr/lib` or `/usr/local/lib`). You may need to set `LD_LIBRARY_PATH` if libraries are in non-standard locations.
+  - For desktop integration, install the application (`sudo cmake --install build`) which installs the `.desktop` file and icon.
+  - The application will appear in your application menu after installation.
 - For best disk stability, record to fast local storage rather than network shares.
