@@ -2,7 +2,9 @@
 #include <QObject>
 #include <QStringList>
 #include <QMutex>
-#include <Processing.NDI.Lib.h>
+
+// Forward declaration to avoid MOC processing NDI headers
+struct NDIlib_find_instance;
 
 class NdiManager : public QObject
 {
@@ -16,7 +18,7 @@ public:
 
 private:
     void ensureInitialized();
-    static NDIlib_find_instance_t s_finder;
+    static void *s_finder; // NDIlib_find_instance_t - cast in .cpp to avoid MOC issues
     static QStringList s_sources;
     static QMutex s_mutex;
 };

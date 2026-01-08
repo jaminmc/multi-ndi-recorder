@@ -2,6 +2,8 @@
 #include <QMainWindow>
 #include <QVector>
 #include <QTimer>
+#include <QCloseEvent>
+#include "SourceRecorder.h"
 #include "SourceTile.h"
 #include "SourceSettingsDialog.h"
 #include "RecordingLibraryModel.h"
@@ -21,7 +23,6 @@ private slots:
     void on_sourceCountSpin_valueChanged(int value);
     void on_startAllButton_clicked();
     void on_stopAllButton_clicked();
-    void on_pauseAllButton_clicked();
     void handleSettings(SourceRecorder *recorder);
     void updateMasterTimer();
     void openRecording();
@@ -29,6 +30,9 @@ private slots:
 
 private:
     void rebuildSources(int count);
+    void loadSettings();
+    void saveSettings();
+    void closeEvent(QCloseEvent *event) override;
 
     Ui::MainWindow *ui;
     QVector<SourceRecorder *> m_recorders;

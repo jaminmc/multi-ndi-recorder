@@ -1,8 +1,9 @@
 #include "NdiManager.h"
 #include "Logging.h"
 #include <QMutexLocker>
+#include <Processing.NDI.Lib.h>
 
-NDIlib_find_instance_t NdiManager::s_finder = nullptr;
+void *NdiManager::s_finder = nullptr;
 QStringList NdiManager::s_sources;
 QMutex NdiManager::s_mutex;
 
@@ -22,7 +23,7 @@ void NdiManager::ensureInitialized()
     }
     if (!s_finder)
     {
-        s_finder = NDIlib_find_create_v2();
+        s_finder = (void*)NDIlib_find_create_v2();
         if (!s_finder)
         {
             Logger::instance().log("Failed to create NDI finder");
@@ -44,7 +45,7 @@ void NdiManager::refreshSources()
         ensureInitialized();
     }
     uint32_t no_sources = 0;
-    const NDIlib_source_t *sources = NDIlib_find_get_current_sources(s_finder, &no_sources);
+    const NDIlib_source_t *sources = NDIlib_find_get_current_sources((NDIlib_find_instance_t)s_finder, &no_sources);
     QStringList list;
     for (uint32_t i = 0; i < no_sources; ++i)
     {

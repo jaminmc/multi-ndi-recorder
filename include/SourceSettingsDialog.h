@@ -1,5 +1,6 @@
 #pragma once
 #include <QDialog>
+#include <QButtonGroup>
 #include "NdiManager.h"
 #include "SourceRecorder.h"
 
@@ -18,9 +19,13 @@ public:
 private slots:
     void refreshNdi();
     void on_buttonBox_accepted();
+    void on_buttonBox_rejected();
+    void updateUIState();
 
 private:
     Ui::SourceSettingsDialog *ui;
     NdiManager m_ndi;
     SourceSettings m_settings;
+    QButtonGroup *m_recordingModeGroup;
+    QButtonGroup *m_qualityModeGroup;
 };

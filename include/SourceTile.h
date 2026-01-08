@@ -1,6 +1,7 @@
 #pragma once
 #include <QWidget>
 #include <QTimer>
+#include <QResizeEvent>
 #include "SourceRecorder.h"
 
 namespace Ui { class SourceTile; }
@@ -18,11 +19,14 @@ public:
 signals:
     void settingsRequested(SourceRecorder *recorder);
 
+protected:
+    void resizeEvent(QResizeEvent *event) override;
+
 private slots:
     void updatePreview();
+    void updateLabel();
     void on_startButton_clicked();
     void on_stopButton_clicked();
-    void on_pauseButton_clicked();
     void on_settingsButton_clicked();
 
 private:
