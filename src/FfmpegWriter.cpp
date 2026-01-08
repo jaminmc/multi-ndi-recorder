@@ -1,6 +1,7 @@
 #include "FfmpegWriter.h"
 #include "Logging.h"
 #include <QDir>
+#include <QFileInfo>
 #include <QDebug>
 #include <QVector>
 #include <QString>
@@ -41,6 +42,25 @@ QString FfmpegWriter::nextFileName()
 
 bool FfmpegWriter::openContext(const QString &path)
 {
+    // Validate path
+    if (path.isEmpty())
+    {
+        Logger::instance().log("Error: Empty file path provided to openContext");
+        return false;
+    }
+    
+    // Ensure parent directory exists
+    QFileInfo fileInfo(path);
+    QDir parentDir = fileInfo.absoluteDir();
+    if (!parentDir.exists())
+    {
+        if (!parentDir.mkpath("."))
+        {
+            Logger::instance().log(QString("Error: Failed to create directory: %1").arg(parentDir.absolutePath()));
+            return false;
+        }
+    }
+    
     // Determine container format from file extension
     QString ext = m_cfg.fileExtension.toLower();
     const char *format = "mp4"; // default

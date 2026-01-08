@@ -49,12 +49,35 @@ rsvg-convert -w 512 -h 512 "${SVG_FILE}" -o "${ICONSET_DIR}/icon_512x512.png"
 # 1024x1024 (512x512@2x)
 rsvg-convert -w 1024 -h 1024 "${SVG_FILE}" -o "${ICONSET_DIR}/icon_512x512@2x.png"
 
-# Create .icns file
-echo "Creating .icns file..."
-iconutil -c icns "${ICONSET_DIR}" -o "${ICNS_FILE}"
+# Create .icns file (macOS)
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    echo "Creating .icns file..."
+    iconutil -c icns "${ICONSET_DIR}" -o "${ICNS_FILE}"
+    echo "macOS icon created successfully: ${ICNS_FILE}"
+fi
 
-# Clean up iconset directory
-rm -rf "${ICONSET_DIR}"
+# Create .ico file (Windows) if Python is available
+ICO_FILE="${SCRIPT_DIR}/app_icon.ico"
+if command -v python3 &> /dev/null; then
+    echo "Creating Windows .ico file..."
+    python3 "${SCRIPT_DIR}/create_ico.py"
+    if [ -f "${ICO_FILE}" ]; then
+        echo "Windows icon created successfully: ${ICO_FILE}"
+    fi
+elif command -v python &> /dev/null; then
+    echo "Creating Windows .ico file..."
+    python "${SCRIPT_DIR}/create_ico.py"
+    if [ -f "${ICO_FILE}" ]; then
+        echo "Windows icon created successfully: ${ICO_FILE}"
+    fi
+else
+    echo "Python not found. Skipping Windows .ico generation."
+    echo "Install Python and Pillow (pip install Pillow) to generate .ico files."
+fi
 
-echo "Icon created successfully: ${ICNS_FILE}"
+# Keep iconset directory for cross-platform icon generation
+# Don't remove it as it's needed for Windows .ico generation
+# rm -rf "${ICONSET_DIR}"
+
+echo "Icon generation complete!"
 

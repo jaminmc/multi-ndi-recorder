@@ -15,6 +15,7 @@ extern "C" {
 
 SourceRecorder::SourceRecorder(QObject *parent)
     : QObject(parent), m_running(false), m_previewOnly(false), m_recordingStarted(false), m_recv(nullptr), 
+      m_reusableVideoFrame(nullptr), m_videoInfoLogged(false), m_audioInfoLogged(false), m_metadataSet(false),
       m_syncEstablished(false), m_hasSeenVideo(false), m_hasSeenAudio(false)
 {
     m_status = "Idle";
@@ -58,6 +59,12 @@ SourceRecorder::~SourceRecorder()
     {
         NDIlib_recv_destroy((NDIlib_recv_instance_t)m_recv);
         m_recv = nullptr;
+    }
+    
+    // Free reusable AVFrame
+    if (m_reusableVideoFrame)
+    {
+        av_frame_free(&m_reusableVideoFrame);
     }
     
     // Stop writer
@@ -197,14 +204,9 @@ void SourceRecorder::startPreview()
     m_previewOnly = true;
     m_recordingStarted = false;
     // Reset metadata and logging flags when starting preview
-    {
-        static bool metadataSet = false;
-        static bool videoInfoLogged = false;
-        static bool audioInfoLogged = false;
-        metadataSet = false;
-        videoInfoLogged = false;
-        audioInfoLogged = false;
-    }
+    m_metadataSet = false;
+    m_videoInfoLogged = false;
+    m_audioInfoLogged = false;
     m_syncEstablished = false;
     m_previewThrottle.invalidate();
     m_status = "Connecting";
@@ -432,6 +434,14 @@ switch (NDIlib_recv_capture_v3((NDIlib_recv_instance_t)m_recv, &videoFrame, &aud
         {
         case NDIlib_frame_type_video:
         {
+            // Validate frame dimensions before processing
+            if (videoFrame.xres <= 0 || videoFrame.yres <= 0 || !videoFrame.p_data)
+            {
+                Logger::instance().log(QString("Invalid video frame dimensions: %1x%2").arg(videoFrame.xres).arg(videoFrame.yres));
+                NDIlib_recv_free_video_v2((NDIlib_recv_instance_t)m_recv, &videoFrame);
+                break;
+            }
+            
             // Update preview (always update preview, even while buffering)
             const bool shouldUpdatePreview = !m_previewThrottle.isValid() || m_previewThrottle.elapsed() >= 200;
             if (shouldUpdatePreview)
@@ -473,8 +483,8 @@ switch (NDIlib_recv_capture_v3((NDIlib_recv_instance_t)m_recv, &videoFrame, &aud
                 }
                 
                 // Log video stream information on first frame
-                static bool videoInfoLogged = false;
-                if (!videoInfoLogged && m_bufferedVideoFrames.isEmpty())
+                
+                if (!m_videoInfoLogged && m_bufferedVideoFrames.isEmpty())
                 {
                     float fps = (videoFrame.frame_rate_D > 0) ? 
                                 (float)videoFrame.frame_rate_N / (float)videoFrame.frame_rate_D : 0.0f;
@@ -493,7 +503,7 @@ switch (NDIlib_recv_capture_v3((NDIlib_recv_instance_t)m_recv, &videoFrame, &aud
                         Logger::instance().verbose(QString("NDI Video Metadata: %1").arg(metadataStr.left(200))); // Limit to first 200 chars
                     }
                     
-                    videoInfoLogged = true;
+                    m_videoInfoLogged = true;
                 }
                 
                 m_hasSeenVideo = true;
@@ -531,8 +541,8 @@ switch (NDIlib_recv_capture_v3((NDIlib_recv_instance_t)m_recv, &videoFrame, &aud
                 }
 
                 // Extract and set metadata from NDI frame (only on first frame to avoid overhead)
-                static bool metadataSet = false;
-                if (!metadataSet)
+                
+                if (!m_metadataSet)
                 {
                     // NDI video frame v2 structure fields:
                     // - picture_aspect_ratio (float)
@@ -543,11 +553,22 @@ switch (NDIlib_recv_capture_v3((NDIlib_recv_instance_t)m_recv, &videoFrame, &aud
                         videoFrame.picture_aspect_ratio,
                         videoFrame.p_metadata
                     );
-                    metadataSet = true;
+                    m_metadataSet = true;
                 }
                 
                 // Write video frame
-                AVFrame *frame = av_frame_alloc();
+                // Optimize: reuse AVFrame to avoid per-frame allocation
+                if (!m_reusableVideoFrame)
+                {
+                    m_reusableVideoFrame = av_frame_alloc();
+                    if (!m_reusableVideoFrame)
+                    {
+                        Logger::instance().log("Failed to allocate reusable AVFrame");
+                        NDIlib_recv_free_video_v2((NDIlib_recv_instance_t)m_recv, &videoFrame);
+                        break;
+                    }
+                }
+                AVFrame *frame = m_reusableVideoFrame;
                 frame->format = AV_PIX_FMT_RGBA;
                 frame->width = videoFrame.xres;
                 frame->height = videoFrame.yres;
@@ -560,7 +581,17 @@ switch (NDIlib_recv_capture_v3((NDIlib_recv_instance_t)m_recv, &videoFrame, &aud
                 int64_t timeSinceSync = videoFrame.timestamp - m_syncTimestamp;
                 if (timeSinceSync < 0)
                     timeSinceSync = 0; // Skip frames before sync point
-                int64_t ptsFromTimestamp = (timeSinceSync * m_sourceFpsNum) / (m_sourceFpsDen * 10000000LL);
+                // Protect against division by zero
+                int64_t ptsFromTimestamp = 0;
+                if (m_sourceFpsDen > 0)
+                {
+                    ptsFromTimestamp = (timeSinceSync * m_sourceFpsNum) / (m_sourceFpsDen * 10000000LL);
+                }
+                else
+                {
+                    Logger::instance().log("Invalid FPS denominator, using default PTS calculation");
+                    ptsFromTimestamp = timeSinceSync / 10000000LL; // Fallback calculation
+                }
                 
                 // Ensure PTS is strictly increasing (at least 1 frame apart)
                 // This prevents duplicate PTS values that cause DTS errors
@@ -576,7 +607,7 @@ switch (NDIlib_recv_capture_v3((NDIlib_recv_instance_t)m_recv, &videoFrame, &aud
                 {
                     Logger::instance().log("Failed to write video frame");
                 }
-                av_frame_free(&frame);
+                // Note: Don't free frame here - it's reused
 
                 if (m_writer.needsRollover())
                 {
@@ -591,6 +622,15 @@ switch (NDIlib_recv_capture_v3((NDIlib_recv_instance_t)m_recv, &videoFrame, &aud
         }
         case NDIlib_frame_type_audio:
         {
+            // Validate audio frame parameters before processing
+            if (audioFrame.no_samples <= 0 || audioFrame.no_channels <= 0 || audioFrame.sample_rate <= 0 || !audioFrame.p_data)
+            {
+                Logger::instance().log(QString("Invalid audio frame parameters: %1 samples, %2 channels, %3 Hz")
+                                      .arg(audioFrame.no_samples).arg(audioFrame.no_channels).arg(audioFrame.sample_rate));
+                NDIlib_recv_free_audio_v3((NDIlib_recv_instance_t)m_recv, &audioFrame);
+                break;
+            }
+            
             // In preview-only mode, skip audio processing
             if (m_previewOnly)
             {
@@ -608,8 +648,8 @@ switch (NDIlib_recv_capture_v3((NDIlib_recv_instance_t)m_recv, &videoFrame, &aud
                 }
                 
                 // Log audio stream information on first frame
-                static bool audioInfoLogged = false;
-                if (!audioInfoLogged && m_bufferedAudioFrames.isEmpty())
+                
+                if (!m_audioInfoLogged && m_bufferedAudioFrames.isEmpty())
                 {
                     QString channelLayout = (audioFrame.no_channels == 1) ? "Mono" :
                                            (audioFrame.no_channels == 2) ? "Stereo" :
@@ -620,7 +660,7 @@ switch (NDIlib_recv_capture_v3((NDIlib_recv_instance_t)m_recv, &videoFrame, &aud
                                           .arg(audioFrame.sample_rate)
                                           .arg(audioFrame.no_samples));
                     
-                    audioInfoLogged = true;
+                    m_audioInfoLogged = true;
                 }
                 
                 m_hasSeenAudio = true;
@@ -926,10 +966,6 @@ void SourceRecorder::establishSyncAndStartRecording()
     // Must have at least one type of frame
     if (m_bufferedVideoFrames.isEmpty() && m_bufferedAudioFrames.isEmpty())
         return;
-    
-    // For audio-only sources, need at least 1 frame
-    if (m_bufferedVideoFrames.isEmpty() && m_bufferedAudioFrames.isEmpty())
-        return;
 
     bool hasVideo = !m_bufferedVideoFrames.isEmpty();
     bool hasAudio = !m_bufferedAudioFrames.isEmpty();
@@ -1142,7 +1178,17 @@ void SourceRecorder::establishSyncAndStartRecording()
             
             // Calculate PTS from timestamp relative to sync point
             int64_t timeSinceSync = buffered.timestamp - m_syncTimestamp;
-            int64_t ptsFromTimestamp = (timeSinceSync * m_sourceFpsNum) / (m_sourceFpsDen * 10000000LL);
+            // Protect against division by zero
+            int64_t ptsFromTimestamp = 0;
+            if (m_sourceFpsDen > 0)
+            {
+                ptsFromTimestamp = (timeSinceSync * m_sourceFpsNum) / (m_sourceFpsDen * 10000000LL);
+            }
+            else
+            {
+                Logger::instance().log("Invalid FPS denominator in flush, using default PTS calculation");
+                ptsFromTimestamp = timeSinceSync / 10000000LL; // Fallback calculation
+            }
             
             // Ensure PTS is strictly increasing (at least 1 frame apart)
             // This prevents duplicate PTS values that cause DTS errors
@@ -1167,7 +1213,17 @@ void SourceRecorder::establishSyncAndStartRecording()
             if (buffered.timestamp < m_syncTimestamp) {
                 // Check if we need to use partial frame
                 int64_t timeDiff = m_syncTimestamp - buffered.timestamp;
-                int64_t samplesToSkip = (timeDiff * buffered.sampleRate) / 10000000LL;
+                // Protect against division by zero and validate sample rate
+                int64_t samplesToSkip = 0;
+                if (buffered.sampleRate > 0)
+                {
+                    samplesToSkip = (timeDiff * buffered.sampleRate) / 10000000LL;
+                }
+                else
+                {
+                    Logger::instance().log(QString("Invalid sample rate in buffered audio frame: %1").arg(buffered.sampleRate));
+                    continue; // Skip this frame
+                }
                 if (samplesToSkip >= buffered.numSamples)
                     continue; // Skip entire frame
                 

@@ -70,6 +70,41 @@ file(GLOB HEADER_FILES
     include/*.h
 )
 
+# Icon configuration for all platforms
+set(ICON_ICONSET_DIR "${CMAKE_SOURCE_DIR}/icons/app_icon.iconset")
+set(ICON_ICNS_FILE "${CMAKE_SOURCE_DIR}/icons/app_icon.icns")
+set(ICON_ICO_FILE "${CMAKE_SOURCE_DIR}/icons/app_icon.ico")
+set(ICON_SVG_FILE "${CMAKE_SOURCE_DIR}/icons/app_icon.svg")
+
+# Windows icon configuration
+if (WIN32)
+    # Generate .ico file from iconset if it doesn't exist
+    if (NOT EXISTS "${ICON_ICO_FILE}" AND EXISTS "${ICON_ICONSET_DIR}")
+        message(STATUS "Generating Windows .ico file from iconset...")
+        find_program(PYTHON3_EXECUTABLE NAMES python3 python)
+        if (PYTHON3_EXECUTABLE)
+            execute_process(
+                COMMAND ${PYTHON3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/icons/create_ico.py"
+                WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/icons"
+                RESULT_VARIABLE ICO_RESULT
+                OUTPUT_QUIET
+                ERROR_QUIET
+            )
+            if (NOT ICO_RESULT EQUAL 0)
+                message(WARNING "Failed to generate .ico file. You may need to run icons/create_ico.py manually.")
+            endif()
+        else()
+            message(WARNING "Python not found. Cannot auto-generate .ico file. Run icons/create_ico.py manually.")
+        endif()
+    endif()
+    
+    # Add Windows resource file for icon embedding
+    if (EXISTS "${CMAKE_SOURCE_DIR}/app_icon.rc" AND EXISTS "${ICON_ICO_FILE}")
+        enable_language(RC)
+        set(RESOURCE_FILE "${CMAKE_SOURCE_DIR}/app_icon.rc")
+    endif()
+endif()
+
 # macOS bundle configuration
 if (APPLE)
     set(MACOSX_BUNDLE_BUNDLE_NAME "Multi NDI Recorder")
@@ -80,9 +115,6 @@ if (APPLE)
     set(MACOSX_BUNDLE_ICON_FILE "app_icon.icns")
     
     # Generate .icns file from iconset if it doesn't exist
-    set(ICON_ICONSET_DIR "${CMAKE_SOURCE_DIR}/icons/app_icon.iconset")
-    set(ICON_ICNS_FILE "${CMAKE_SOURCE_DIR}/icons/app_icon.icns")
-    
     # Check if .icns exists, if not try to generate it
     if (NOT EXISTS "${ICON_ICNS_FILE}" AND EXISTS "${ICON_ICONSET_DIR}")
         message(STATUS "Generating app icon from iconset...")
@@ -112,7 +144,14 @@ if (APPLE)
         target_sources(${PROJECT_NAME} PRIVATE "${ICON_ICNS_FILE}")
     endif()
 else()
-    add_executable(${PROJECT_NAME} ${SRC_FILES} ${HEADER_FILES} ui/MainWindow.ui ui/SourceSettingsDialog.ui ui/SourceTile.ui)
+    # Windows or Linux
+    if (WIN32 AND EXISTS "${RESOURCE_FILE}")
+        # Windows: include resource file for icon embedding
+        add_executable(${PROJECT_NAME} WIN32 ${SRC_FILES} ${HEADER_FILES} ${RESOURCE_FILE} ui/MainWindow.ui ui/SourceSettingsDialog.ui ui/SourceTile.ui)
+    else()
+        # Linux: regular executable
+        add_executable(${PROJECT_NAME} ${SRC_FILES} ${HEADER_FILES} ui/MainWindow.ui ui/SourceSettingsDialog.ui ui/SourceTile.ui)
+    endif()
 endif()
 
 target_link_libraries(${PROJECT_NAME}
@@ -134,5 +173,28 @@ elseif (APPLE)
     find_library(FOUNDATION_FRAMEWORK Foundation)
     if (COREAUDIO_FRAMEWORK)
         target_link_libraries(${PROJECT_NAME} ${COREAUDIO_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
+    endif()
+elseif (UNIX AND NOT APPLE)
+    # Linux: Install desktop file and icon
+    set(DESKTOP_FILE "${CMAKE_SOURCE_DIR}/multindirecorder.desktop")
+    set(ICON_INSTALL_DIR "${CMAKE_INSTALL_PREFIX}/share/pixmaps")
+    set(DESKTOP_INSTALL_DIR "${CMAKE_INSTALL_PREFIX}/share/applications")
+    
+    # Install desktop file
+    if (EXISTS "${DESKTOP_FILE}")
+        install(FILES "${DESKTOP_FILE}"
+                DESTINATION "${DESKTOP_INSTALL_DIR}"
+                RENAME "multindirecorder.desktop")
+    endif()
+    
+    # Install icon files (prefer SVG, fallback to PNG)
+    if (EXISTS "${ICON_SVG_FILE}")
+        install(FILES "${ICON_SVG_FILE}"
+                DESTINATION "${ICON_INSTALL_DIR}"
+                RENAME "multindirecorder.svg")
+    elseif (EXISTS "${ICON_ICONSET_DIR}/icon_256x256.png")
+        install(FILES "${ICON_ICONSET_DIR}/icon_256x256.png"
+                DESTINATION "${ICON_INSTALL_DIR}"
+                RENAME "multindirecorder.png")
     endif()
 endif()

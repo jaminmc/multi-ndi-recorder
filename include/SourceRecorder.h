@@ -101,6 +101,14 @@ private:
     QElapsedTimer m_previewThrottle;
     void *m_recv; // NDIlib_recv_instance* - cast in .cpp to avoid MOC issues
     
+    // Optimize: reusable AVFrame to avoid per-frame allocation
+    struct AVFrame *m_reusableVideoFrame;
+    
+    // Optimize: moved from static variables for better thread safety
+    bool m_videoInfoLogged;
+    bool m_audioInfoLogged;
+    bool m_metadataSet;
+    
     // Sync buffering
     bool m_syncEstablished;
     QVector<BufferedVideoFrame> m_bufferedVideoFrames;

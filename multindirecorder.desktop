@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Multi NDI Recorder
+Comment=Record multiple NDI sources simultaneously
+Exec=MultiNdiRecorder
+Icon=multindirecorder
+Categories=AudioVideo;Recorder;Video;
+Terminal=false
+StartupNotify=true
+
