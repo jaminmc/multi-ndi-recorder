@@ -96,7 +96,6 @@ bool FfmpegWriter::openContext(const QString &path)
     m_lastVideoPts = AV_NOPTS_VALUE;
     m_firstAudioPts = 0;
     m_firstVideoFrameWritten = false;
-    m_lastVideoPts = AV_NOPTS_VALUE;
     m_firstAudioFrameWritten = false;
     m_startMs = QDateTime::currentMSecsSinceEpoch();
     return true;
@@ -255,7 +254,6 @@ void FfmpegWriter::stop()
     m_lastVideoPts = AV_NOPTS_VALUE;
     m_firstAudioPts = 0;
     m_firstVideoFrameWritten = false;
-    m_lastVideoPts = AV_NOPTS_VALUE;
     m_firstAudioFrameWritten = false;
     m_ndiColorFormat = 0;
     m_ndiPictureAspectRatio = 0.0f;
@@ -983,7 +981,6 @@ void FfmpegWriter::setSyncTimestamp(int64_t ndiTimestamp)
     m_lastVideoPts = AV_NOPTS_VALUE;
     m_firstAudioPts = 0;
     m_firstVideoFrameWritten = false;
-    m_lastVideoPts = AV_NOPTS_VALUE;
     m_firstAudioFrameWritten = false;
     for (auto &audioInfo : m_audioStreams)
     {
@@ -1433,7 +1430,6 @@ void FfmpegWriter::rollover()
     m_lastVideoPts = AV_NOPTS_VALUE;
     m_firstAudioPts = 0;
     m_firstVideoFrameWritten = false;
-    m_lastVideoPts = AV_NOPTS_VALUE;
     m_firstAudioFrameWritten = false;
     
     m_currentFile = nextFileName();

@@ -203,7 +203,7 @@ void MainWindow::loadSettings()
         s.qualityMode = settings.value(prefix + "qualityMode", "crf").toString();
         s.crfValue = settings.value(prefix + "crfValue", 23).toInt();
         s.videoBitrate = settings.value(prefix + "videoBitrate", 12000000).toInt();
-        s.hardwareQuality = settings.value(prefix + "hardwareQuality", 50).toInt();
+        s.hardwareQuality = settings.value(prefix + "hardwareQuality", 55).toInt();
         
         if (!s.ndiSource.isEmpty() || !s.label.isEmpty() || !s.outputFolder.isEmpty())
         {
